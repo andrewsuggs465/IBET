@@ -1,8 +1,3 @@
-<<<<<<< HEAD
-void setup() {
-  // put your setup code here, to run once:
-  //comment
-=======
 /*
  * Created by ArduinoGetStarted.com
  *
@@ -25,7 +20,6 @@ void setup() {
   rfid.PCD_Init(); // init MFRC522
 
   Serial.println("Tap RFID/NFC Tag on reader");
->>>>>>> cce530a (rfid)
 }
 
 void loop() {
