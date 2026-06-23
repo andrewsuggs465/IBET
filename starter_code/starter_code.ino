@@ -1,29 +1,28 @@
 /*
- * IBET Security Pouch — Arduino R4 Prototype
+ * IBET Security Pouch — Arduino R4 Prototype (RFID + Motion + Logging)
  *
- * WIRING:
- *   MFRC522 RFID : SS=10, RST=5, MOSI=11, MISO=12, SCK=13
- *   Servo        : pin 9
- *   RGB LED      : R=6, G=7, B=8  (common-cathode; add 220Ω resistors)
- *   Buzzer       : pin 3
- *   Button       : pin 2 → GND  (uses internal pull-up)
- *
- * DEMO FLOW:
- *   1. Power on → GREEN (unlocked / unarmed)
- *   2. Scan tag  → enrolls tag, locks bag → RED (locked / armed)
- *   3. Press btn → ALARM (siren + flashing red/blue)
- *   4. Scan tag  → disarms + unlocks → GREEN
- *   5. Scan tag  → locks again → RED
- *   6. Wrong tag → brief BLUE flash, stays RED
+ * FEATURES:
+ *  - RFID lock/unlock system
+ *  - Servo locking mechanism
+ *  - RGB status LED
+ *  - Button-triggered alarm
+ *  - Buzzer siren
+ *  - MPU6050 motion detection (GY-87)
+ *  - LIVE accelerometer logging to Serial Monitor
  */
 
 #include <SPI.h>
 #include <MFRC522.h>
 #include <Servo.h>
+#include <Wire.h>
+#include <MPU6050_light.h>
+#include <math.h>
 
-// ── Pin assignments ──────────────────────────────────────────────────────────
+// ── RFID ─────────────────────────────────────────────
 #define SS_PIN    10
 #define RST_PIN    5
+
+// ── Outputs ──────────────────────────────────────────
 #define SERVO_PIN  9
 #define LED_R      6
 #define LED_G      7
@@ -31,118 +30,126 @@
 #define BUZZER     3
 #define BUTTON     2
 
-// ── Servo lock positions (degrees) ──────────────────────────────────────────
+// ── Servo positions ──────────────────────────────────
 const int LOCKED_POS   = 90;
 const int UNLOCKED_POS = 0;
 
-// ── Alarm auto-shutoff ───────────────────────────────────────────────────────
-const unsigned long ALARM_MAX_MS = 30000UL;  // 30 s
+// ── Alarm settings ───────────────────────────────────
+const unsigned long ALARM_MAX_MS = 30000UL;
+const float MOTION_THRESHOLD = 0.35;
 
-// ── Hardware objects ─────────────────────────────────────────────────────────
+// ── Hardware objects ─────────────────────────────────
 MFRC522 rfid(SS_PIN, RST_PIN);
-Servo   lockServo;
+Servo lockServo;
+MPU6050 mpu(Wire);
 
-// ── Enrolled RFID tag ────────────────────────────────────────────────────────
+// ── RFID storage ─────────────────────────────────────
 byte authUID[10];
 byte authUIDLen = 0;
-bool enrolled   = false;
+bool enrolled = false;
 
-// ── System state ─────────────────────────────────────────────────────────────
-bool locked      = false;
+// ── State ────────────────────────────────────────────
+bool locked = false;
 bool alarmActive = false;
 
-// ── Timing ───────────────────────────────────────────────────────────────────
+// ── Timing ───────────────────────────────────────────
 unsigned long alarmStart = 0;
-unsigned long lastBlink  = 0;
-unsigned long lastBtnMs  = 0;
+unsigned long lastBlink = 0;
+unsigned long lastBtnMs = 0;
+unsigned long lastLogMs = 0;
+
 bool blinkOn = false;
 bool lastBtn = HIGH;
 
-// ── LED helpers ──────────────────────────────────────────────────────────────
+// ── Motion baseline ──────────────────────────────────
+float baseAccel = 1.0;
+
+// ── LED helper ───────────────────────────────────────
 void setLED(bool r, bool g, bool b) {
-  digitalWrite(LED_R, r ? HIGH : LOW);
-  digitalWrite(LED_G, g ? HIGH : LOW);
-  digitalWrite(LED_B, b ? HIGH : LOW);
+  digitalWrite(LED_R, r);
+  digitalWrite(LED_G, g);
+  digitalWrite(LED_B, b);
 }
 
-// ── Lock/unlock ──────────────────────────────────────────────────────────────
+// ── Lock / Unlock ────────────────────────────────────
 void applyLocked() {
   locked = true;
   lockServo.write(LOCKED_POS);
-  setLED(true, false, false);  // red
+  setLED(true, false, false);
   Serial.println(">> LOCKED / ARMED");
 }
 
 void applyUnlocked() {
-  locked      = false;
+  locked = false;
   alarmActive = false;
   noTone(BUZZER);
   lockServo.write(UNLOCKED_POS);
-  setLED(false, true, false);  // green
+  setLED(false, true, false);
   Serial.println(">> UNLOCKED / UNARMED");
 }
 
-// ── Alarm ────────────────────────────────────────────────────────────────────
+// ── Alarm ────────────────────────────────────────────
 void triggerAlarm() {
   if (!alarmActive) {
     alarmActive = true;
-    alarmStart  = millis();
-    Serial.println("!!! ALARM TRIGGERED — scan RFID to disarm !!!");
+    alarmStart = millis();
+    Serial.println("!!! ALARM TRIGGERED !!!");
   }
 }
 
 void updateAlarm() {
   if (!alarmActive) return;
 
-  // Auto-shutoff after ALARM_MAX_MS
   if (millis() - alarmStart > ALARM_MAX_MS) {
     alarmActive = false;
     noTone(BUZZER);
-    setLED(true, false, false);  // back to red (still locked)
-    Serial.println("Alarm auto-shutoff. Still locked — scan RFID to unlock.");
+    setLED(true, false, false);
+    Serial.println("Alarm auto-shutoff (still locked)");
     return;
   }
 
-  // Two-tone siren: alternates every 250 ms
   if ((millis() / 250) % 2 == 0) tone(BUZZER, 2000);
-  else                            tone(BUZZER, 1000);
+  else tone(BUZZER, 1000);
 
-  // Flash red / blue every 150 ms
   if (millis() - lastBlink > 150) {
     lastBlink = millis();
-    blinkOn   = !blinkOn;
+    blinkOn = !blinkOn;
     setLED(blinkOn, false, !blinkOn);
   }
 }
 
-// ── Button ───────────────────────────────────────────────────────────────────
+// ── Button ───────────────────────────────────────────
 void handleButton() {
   bool btn = digitalRead(BUTTON);
-  // Falling edge with 200 ms debounce
+
   if (btn == LOW && lastBtn == HIGH && millis() - lastBtnMs > 200) {
     lastBtnMs = millis();
+
     if (locked) {
       triggerAlarm();
     } else {
-      Serial.println("Bag is unarmed — lock it first to arm the alarm.");
+      Serial.println("Lock bag first to arm alarm.");
     }
   }
+
   lastBtn = btn;
 }
 
-// ── RFID ─────────────────────────────────────────────────────────────────────
+// ── RFID ─────────────────────────────────────────────
 bool uidMatches() {
   if (rfid.uid.size != authUIDLen) return false;
+
   for (byte i = 0; i < authUIDLen; i++) {
     if (rfid.uid.uidByte[i] != authUID[i]) return false;
   }
+
   return true;
 }
 
 void printUID() {
-  Serial.print("Scanned UID:");
+  Serial.print("UID:");
   for (byte i = 0; i < rfid.uid.size; i++) {
-    Serial.print(rfid.uid.uidByte[i] < 0x10 ? " 0" : " ");
+    Serial.print(" ");
     Serial.print(rfid.uid.uidByte[i], HEX);
   }
   Serial.println();
@@ -150,56 +157,116 @@ void printUID() {
 
 void handleRFID() {
   if (!rfid.PICC_IsNewCardPresent()) return;
-  if (!rfid.PICC_ReadCardSerial())   return;
+  if (!rfid.PICC_ReadCardSerial()) return;
 
   printUID();
 
   if (!enrolled) {
-    // First scan: register this tag as the owner key
     authUIDLen = rfid.uid.size;
-    for (byte i = 0; i < authUIDLen; i++) authUID[i] = rfid.uid.uidByte[i];
+    for (byte i = 0; i < authUIDLen; i++)
+      authUID[i] = rfid.uid.uidByte[i];
+
     enrolled = true;
-    Serial.println("Tag enrolled! Locking bag...");
+    Serial.println("Tag enrolled");
     applyLocked();
 
   } else if (uidMatches()) {
+
     if (locked) applyUnlocked();
-    else        applyLocked();
+    else applyLocked();
 
   } else {
-    Serial.println("Unknown tag — access denied.");
-    // Brief blue flash then restore status color
+    Serial.println("Wrong tag");
+
     setLED(false, false, true);
     delay(300);
+
     if (locked) setLED(true, false, false);
-    else        setLED(false, true, false);
+    else setLED(false, true, false);
   }
 
   rfid.PICC_HaltA();
   rfid.PCD_StopCrypto1();
 }
 
-// ── Setup / Loop ─────────────────────────────────────────────────────────────
+// ── Motion detection ────────────────────────────────
+void handleMotion() {
+  if (!locked) return;
+
+  mpu.update();
+
+  float ax = mpu.getAccX();
+  float ay = mpu.getAccY();
+  float az = mpu.getAccZ();
+
+  float totalAccel = sqrt(ax * ax + ay * ay + az * az);
+  float delta = abs(totalAccel - baseAccel);
+
+  // Trigger alarm if moved too much
+  if (!alarmActive && delta > MOTION_THRESHOLD) {
+    Serial.println("Motion detected!");
+    triggerAlarm();
+  }
+}
+
+// ── ACCELEROMETER LOGGING ───────────────────────────
+void logAccelerometer() {
+  if (millis() - lastLogMs < 200) return; // 5 Hz logging
+  lastLogMs = millis();
+
+  mpu.update();
+
+  float ax = mpu.getAccX();
+  float ay = mpu.getAccY();
+  float az = mpu.getAccZ();
+
+  float total = sqrt(ax * ax + ay * ay + az * az);
+
+  Serial.print("ACC -> X:");
+  Serial.print(ax, 3);
+  Serial.print(" Y:");
+  Serial.print(ay, 3);
+  Serial.print(" Z:");
+  Serial.print(az, 3);
+  Serial.print(" | Total:");
+  Serial.println(total, 3);
+}
+
+// ── Setup ────────────────────────────────────────────
 void setup() {
   Serial.begin(9600);
+
   SPI.begin();
   rfid.PCD_Init();
 
+  Wire.begin();
+
+  mpu.begin();
+  mpu.calcOffsets(true, true);
+
+  baseAccel = 1.0;
+
   lockServo.attach(SERVO_PIN);
 
-  pinMode(LED_R,  OUTPUT);
-  pinMode(LED_G,  OUTPUT);
-  pinMode(LED_B,  OUTPUT);
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
   pinMode(BUZZER, OUTPUT);
   pinMode(BUTTON, INPUT_PULLUP);
 
   applyUnlocked();
-  Serial.println("=== IBET Security Pouch Prototype ===");
-  Serial.println("Scan your RFID tag to enroll and lock the bag.");
+
+  Serial.println("=== IBET Security Pouch Ready ===");
+  Serial.println("Accelerometer logging enabled (5 Hz)");
 }
 
+// ── Loop ─────────────────────────────────────────────
 void loop() {
   handleButton();
   handleRFID();
   updateAlarm();
+  handleMotion();
+
+  // LIVE sensor output
+  logAccelerometer();
 }
